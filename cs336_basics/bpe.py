@@ -62,7 +62,11 @@ def pre_tokenization(input_tuple: tuple[str, int, int, str]) -> Iterable[re.Matc
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
 
-    pre_tokens = re.finditer(PAT, re.sub(r'\s+'.join(special_tokens), '', chunk))
+    special_pattern = "|".join(re.escape(token) for token in special_tokens)
+    if special_pattern:
+        chunk = re.sub(special_pattern, "", chunk)
+    pre_tokens = re.finditer(PAT, chunk)
+
     counts = Counter()
     for token in pre_tokens:
         counts[token.group()] += 1    
@@ -123,52 +127,75 @@ class BPETokenizer:
 
     def train_bpe(self, vocab_size: int) -> None:
         self._reset()
+        print("Training pre-tokenizer...")
         self._train_pre_tokenizer()
-        self._train_bpe(vocab_size)
 
-    def _train_bpe(self, vocab_size: int) -> None:
-        _counter = self._initialize_counter()
+        pre_token_words = Counter()
+        for token, count in self._pre_tokenizer.items():
+            token_ids = tuple(token.encode('utf-8'))
+            pre_token_words[token_ids] += count
+        
+        print("Training BPE...")
+        self._train_bpe(vocab_size, pre_token_words)
+
+    def _train_bpe(self, vocab_size: int, pre_token_words: Counter) -> None:
+        _counter = self._initialize_counter(pre_token_words)
         while len(self.vocab) < vocab_size:
             result = self._get_most_frequent_pair(_counter)
             if result is None:
                 break
             pairs, cnt = result
-            print(f"Most frequent pair: {pairs}")
-            self._merge_pair(pairs, _counter)
+            print(f"Len vocab: {len(self.vocab)}, Most frequent pair: {pairs}")
+            self._merge_pair(pairs, pre_token_words)
 
-    def _initialize_counter(self) -> Counter:
+            _counter = self._initialize_counter(pre_token_words)
+
+    def _initialize_counter(self, pre_token_words: Counter) -> Counter:
         counter = Counter()
-        for token in self._pre_tokenizer:
-            token_bytes = token.encode('utf-8')
-            cnt = self._pre_tokenizer[token]
-            for i in range(len(token_bytes) - 1):
-                counter[(token_bytes[i], token_bytes[i + 1])] += cnt
+        
+        for token_ids, count in pre_token_words.items():
+            for i in range(len(token_ids) - 1):
+                pair = (token_ids[i], token_ids[i + 1])
+                counter[pair] += count
         return counter
 
     def _get_most_frequent_pair(self, counter: Counter) -> tuple[int, int]:
-        if counter.most_common(1):
-            return counter.most_common(1)[0]
-        else:
+        if not counter:
             return None
+        return max(
+            counter.items(),
+            key=lambda item: (
+                item[1],
+                self.id_to_token[item[0][0]],
+                self.id_to_token[item[0][1]],
+            ),
+        )
 
-    def _merge_pair(self, pair: tuple[int, int], _counter: Counter) -> None:
-        merged_bytes = self.id_to_token[pair[0]] + self.id_to_token[pair[1]]
+    def _merge_pair(self, pair: tuple[int, int], pre_token_words: Counter) -> None:
+        left_token, right_token = self.id_to_token[pair[0]], self.id_to_token[pair[1]]
+        merged_token = left_token + right_token
+
         merged_id = len(self.vocab)
-
-        self.vocab[merged_bytes] = merged_id
-        self.id_to_token[merged_id] = merged_bytes
+        self.vocab[merged_token] = merged_id
+        self.id_to_token[merged_id] = merged_token
         self.merge_rank[pair] = len(self.merge_rank)
-        self.merges.append((self.id_to_token[pair[0]], self.id_to_token[pair[1]]))
+        self.merges.append((left_token, right_token))
 
-        # update the counter 
-        del _counter[pair]
-
-        for token, cnt in self._pre_tokenizer.items():
-            token_bytes = token.encode('utf-8')
-            for i in range(len(token_bytes) - len(merged_bytes) + 1):
-                # Find all pair occurences and update the counter 
-                if token_bytes[i:i+len(merged_bytes)] == merged_bytes:
-                    _counter[(merged_id, self.vocab[token_bytes[i+len(merged_bytes)]])] += cnt
+        updated_words = Counter()
+        for token_ids, count in pre_token_words.items():
+            new_token_ids = []
+            i = 0
+            while i < len(token_ids):
+                if i < len(token_ids) - 1 and (token_ids[i], token_ids[i + 1]) == pair:
+                    new_token_ids.append(merged_id)
+                    i += 2
+                else:
+                    new_token_ids.append(token_ids[i])
+                    i += 1
+            updated_words[tuple(new_token_ids)] += count
+        
+        pre_token_words.clear()
+        pre_token_words.update(updated_words)
 
     def encode(self, text: str) -> list[int]:
         result = []
