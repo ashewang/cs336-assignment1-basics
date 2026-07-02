@@ -80,20 +80,23 @@ class BPETokenizer:
         self.id_to_token = {} # id to token (string)
         # Keep track of the pairs we have merged
         self.merge_rank = {} # pair to merge rank (integer)
+        self.merges = []
         self._pre_tokenizer = None
     
     def _reset(self) -> None:
         self.vocab = {}
         self.id_to_token = {}
         self.merge_rank = {}
+        self.merges = []
         # Every byte is a vocab, to intialize 
         for byte in range(256):
             self.vocab[chr(byte)] = byte
             self.id_to_token[byte] = chr(byte)
         # Add special tokens to the vocab
         for special_token in self.special_tokens:
-            self.vocab[special_token] = len(self.vocab)
-            self.id_to_token[len(self.vocab)] = special_token
+            special_token_id = len(self.vocab)
+            self.vocab[special_token] = special_token_id
+            self.id_to_token[special_token_id] = special_token
         
 
     def _train_pre_tokenizer(self):
@@ -155,6 +158,7 @@ class BPETokenizer:
         self.vocab[merged_bytes] = merged_id
         self.id_to_token[merged_id] = merged_bytes
         self.merge_rank[pair] = len(self.merge_rank)
+        self.merges.append((self.id_to_token[pair[0]], self.id_to_token[pair[1]]))
 
         # update the counter 
         del _counter[pair]
