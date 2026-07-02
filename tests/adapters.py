@@ -590,7 +590,22 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
     from cs336_basics.bpe import BPETokenizer
-    tokenizer = BPETokenizer(input_path, special_tokens, pre_tokenizer)
+    tokenizer = BPETokenizer(
+        input_path=input_path,
+        vocab_size=vocab_size,
+        special_tokens=special_tokens,
+        num_processes=kwargs.get("num_processes", 4),
+    )
     tokenizer.train_bpe(vocab_size)
-    return tokenizer.vocab, tokenizer.merges
+    def token_to_bytes(token: str) -> bytes:
+        return token.encode("latin-1")
+    vocab = {
+        token_id: token_to_bytes(token)
+        for token_id, token in tokenizer.id_to_token.items()
+    }
+    merges = [
+        (token_to_bytes(left), token_to_bytes(right))
+        for left, right in tokenizer.merges
+    ]
+    return vocab, merges
 
