@@ -56,18 +56,31 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
+def pre_tokenization(input_tuple: tuple[str, int, int, str]) -> Iterable[re.Match[str]]:
+    input_path, start, end, special_tokens = input_tuple
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+
+    pre_tokens = re.finditer(PAT, re.sub(r'\s+'.join(special_tokens), '', chunk))
+    counts = Counter()
+    for token in pre_tokens:
+        counts[token.group()] += 1    
+    return counts
+
 class BPETokenizer:
 
-    def __init__(self, input_path, vocab_size, special_tokens, pre_tokenizer):
+    def __init__(self, input_path, vocab_size, special_tokens, num_processes=4):
         self.input_path = input_path
         self.vocab_size = vocab_size
         self.special_tokens = special_tokens
-        self.pre_tokenizer = pre_tokenizer
+        self.num_processes = num_processes
 
         self.vocab = {} # token to id (integer)
         self.id_to_token = {} # id to token (string)
         # Keep track of the pairs we have merged
         self.merge_rank = {} # pair to merge rank (integer)
+        self._pre_tokenizer = None
     
     def _reset(self) -> None:
         self.vocab = {}
@@ -77,6 +90,29 @@ class BPETokenizer:
         for byte in range(256):
             self.vocab[chr(byte)] = byte
             self.id_to_token[byte] = chr(byte)
+        # Add special tokens to the vocab
+        for special_token in self.special_tokens:
+            self.vocab[special_token] = len(self.vocab)
+            self.id_to_token[len(self.vocab)] = special_token
+        
+
+    def _train_pre_tokenizer(self):
+        with open(self.input_path, "rb") as f:
+            boundaries = find_chunk_boundaries(f, self.num_processes, b"<|endoftext|>")
+            tasks = [
+                (self.input_path, start, end, self.special_tokens)
+                for start, end in zip(boundaries[:-1], boundaries[1:])
+            ]
+
+        # The following is a serial implementation, but you can parallelize this
+        # by sending each start/end pair to a set of processes.
+        # 1. Pre-tokenization is done in parallel 
+        with multiprocessing.Pool() as pool:
+            counters = pool.map(pre_tokenization, tasks)
+        
+        self._pre_tokenizer = Counter()
+        for counter in counters:
+            self._pre_tokenizer.update(counter)
 
     def _read_corpus(self, input_path: str |  os.PathLike) -> str:
         with open(input_path, 'r') as f:
@@ -84,6 +120,7 @@ class BPETokenizer:
 
     def train_bpe(self, vocab_size: int) -> None:
         self._reset()
+        self._train_pre_tokenizer()
         self._train_bpe(vocab_size)
 
     def _train_bpe(self, vocab_size: int) -> None:
@@ -98,9 +135,9 @@ class BPETokenizer:
 
     def _initialize_counter(self) -> Counter:
         counter = Counter()
-        for token in self.pre_tokenizer:
+        for token in self._pre_tokenizer:
             token_bytes = token.encode('utf-8')
-            cnt = self.pre_tokenizer[token]
+            cnt = self._pre_tokenizer[token]
             for i in range(len(token_bytes) - 1):
                 counter[(token_bytes[i], token_bytes[i + 1])] += cnt
         return counter
@@ -122,7 +159,7 @@ class BPETokenizer:
         # update the counter 
         del _counter[pair]
 
-        for token, cnt in self.pre_tokenizer.items():
+        for token, cnt in self._pre_tokenizer.items():
             token_bytes = token.encode('utf-8')
             for i in range(len(token_bytes) - len(merged_bytes) + 1):
                 # Find all pair occurences and update the counter 
@@ -140,18 +177,6 @@ class BPETokenizer:
             result.append(self.vocab[char])
         return result
 
-def pre_tokenization(input_tuple: tuple[str, int, int, str]) -> Iterable[re.Match[str]]:
-    input_path, start, end, special_tokens = input_tuple
-    with open(input_path, "rb") as f:
-        f.seek(start)
-        chunk = f.read(end - start).decode("utf-8", errors="ignore")
-
-    pre_tokens = re.finditer(PAT, re.sub(r'\s+'.join(special_tokens), '', chunk))
-    counts = Counter()
-    for token in pre_tokens:
-        counts[token.group()] += 1    
-    return counts
-
 
 if __name__ == "__main__":
     start_time = time.time()
@@ -160,26 +185,9 @@ if __name__ == "__main__":
     
     input_path = "data/ashe.txt"
     input_path = "data/TinyStoriesV2-GPT4-train.txt"
-    with open(input_path, "rb") as f:
-        num_processes = 4
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-    
-    tasks = [(input_path, start, end, special_tokens) for start, end in zip(boundaries[:-1], boundaries[1:])]
 
-    # The following is a serial implementation, but you can parallelize this
-    # by sending each start/end pair to a set of processes.
-    # 1. Pre-tokenization is done in parallel 
-    with multiprocessing.Pool() as pool:
-        counters = pool.map(pre_tokenization, tasks)
-    
-    total_counter = Counter()
-    for counter in counters:
-        total_counter.update(counter)
-
-    
-    print(f"Time taken for pre-tokenization: {time.time() - start_time} seconds. Total counter: {total_counter.most_common(10)}")
     # 2. Train the BPE model 
-    encoder = BPETokenizer("data/TinyStoriesV2-GPT4-train.txt", 500, ["<|endoftext|>"], total_counter)
+    encoder = BPETokenizer(input_path, 500, special_tokens)
     start_time = time.time()
     encoder.train_bpe(max_vocab_size)
     print(f"Time taken for training BPE: {time.time() - start_time} seconds")
