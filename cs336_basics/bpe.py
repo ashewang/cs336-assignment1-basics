@@ -154,6 +154,15 @@ class BPETokenizer:
             self._merge_pair(pairs, pre_token_words)
 
             _counter = self._initialize_counter(pre_token_words)
+        
+    def _build_index(self, pre_token_words: Counter):
+        pair_count = Counter()
+        pair_to_words = {}
+        for token_ids, count in pre_token_words.items():
+            for pair in self._iter_pairs(token_ids):
+                pair_count[pair] += count
+                pair_to_words.setdefault(pair, set()).add(token_ids)
+        return pair_count, pair_to_words
 
     def _initialize_counter(self, pre_token_words: Counter) -> Counter:
         counter = Counter()
@@ -230,6 +239,6 @@ if __name__ == "__main__":
     start_time = time.time()
     encoder.train_bpe(max_vocab_size)
     print(f"Time taken for training BPE: {time.time() - start_time} seconds")
-    print(f"Vocab: {encoder.vocab}")
-    print(f"Id to token: {encoder.id_to_token}")
-    print(f"Merge rank: {encoder.merge_rank}")
+    #print(f"Vocab: {encoder.vocab}")
+    #print(f"Id to token: {encoder.id_to_token}")
+    #print(f"Merge rank: {encoder.merge_rank}")
