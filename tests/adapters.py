@@ -594,8 +594,8 @@ def run_train_bpe(
     tokenizer = BPETokenizer(input_path, vocab_size, special_tokens)
     tokenizer.train_bpe(vocab_size)
 
-    def token_to_bytes(token: str) -> bytes:
-        return token.encode("latin-1")
+    def token_to_bytes(token) -> bytes:
+        return token if isinstance(token, bytes) else token.encode("latin-1")
 
     vocab = {idx: token_to_bytes(token) for idx, token in tokenizer.id_to_token.items()}
     merges = [(token_to_bytes(left), token_to_bytes(right)) for left, right in tokenizer.merges]
