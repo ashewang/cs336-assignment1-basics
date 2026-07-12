@@ -4,8 +4,7 @@ import regex as re
 import multiprocessing
 from collections import Counter
 from typing import BinaryIO, Iterable
-from itertools import islice
-
+from heapq import heappush, heappop
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -21,56 +20,64 @@ def find_chunk_boundaries(
     """
     assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
 
-    # Get total file size in bytes
     file.seek(0, os.SEEK_END)
     file_size = file.tell()
     file.seek(0)
 
     chunk_size = file_size // desired_num_chunks
-
-    # Initial guesses for chunk boundary locations, uniformly spaced
-    # Chunks start on previous index, don't include last index
     chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
     chunk_boundaries[-1] = file_size
 
-    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+    mini_chunk_size = 4096
 
     for bi in range(1, len(chunk_boundaries) - 1):
         initial_position = chunk_boundaries[bi]
-        file.seek(initial_position)  # Start at boundary guess
+        file.seek(initial_position)
         while True:
-            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
-
-            # If EOF, this boundary should be at the end of the file
+            mini_chunk = file.read(mini_chunk_size)
             if mini_chunk == b"":
                 chunk_boundaries[bi] = file_size
                 break
-
-            # Find the special token in the mini chunk
             found_at = mini_chunk.find(split_special_token)
             if found_at != -1:
                 chunk_boundaries[bi] = initial_position + found_at
                 break
             initial_position += mini_chunk_size
 
-    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-def pre_tokenization(input_tuple: tuple[str, int, int, str]) -> Iterable[re.Match[str]]:
+
+def pre_tokenization(input_tuple):
     input_path, start, end, special_tokens = input_tuple
     with open(input_path, "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
 
-    special_pattern = "|".join(re.escape(token) for token in special_tokens)
-    if special_pattern:
-        chunk = re.sub(special_pattern, "", chunk)
-    pre_tokens = re.finditer(PAT, chunk)
+    # split on special tokens (don't delete-then-concat), keep segments separate
+    if special_tokens:
+        split_pattern = "|".join(re.escape(tok) for tok in special_tokens)
+        segments = re.split(split_pattern, chunk)
+    else:
+        segments = [chunk]
 
     counts = Counter()
-    for token in pre_tokens:
-        counts[token.group()] += 1    
+    for seg in segments:
+        for m in re.finditer(PAT, seg):
+            counts[m.group()] += 1
     return counts
+
+
+class RevPair:
+    """Wrap the (left_str, right_str) key so the min-heap pops the pair with the
+    largest count and, on ties, the lexicographically greatest pair."""
+    __slots__ = ("pair",)
+
+    def __init__(self, pair):
+        self.pair = pair
+
+    def __lt__(self, other):
+        return self.pair > other.pair  # reversed: bigger string sorts "smaller"
+
 
 class BPETokenizer:
 
@@ -80,28 +87,25 @@ class BPETokenizer:
         self.special_tokens = special_tokens
         self.num_processes = num_processes
 
-        self.vocab = {} # token to id (integer)
-        self.id_to_token = {} # id to token (string)
-        # Keep track of the pairs we have merged
-        self.merge_rank = {} # pair to merge rank (integer)
+        self.vocab = {}         # token (str) -> id (int)
+        self.id_to_token = {}   # id (int) -> token (str)
+        self.merge_rank = {}    # pair -> merge rank
         self.merges = []
         self._pre_tokenizer = None
-    
+
     def _reset(self) -> None:
         self.vocab = {}
         self.id_to_token = {}
         self.merge_rank = {}
         self.merges = []
-        # Every byte is a vocab, to intialize 
         for byte in range(256):
-            self.vocab[chr(byte)] = byte
-            self.id_to_token[byte] = chr(byte)
-        # Add special tokens to the vocab
+            self.vocab[bytes([byte])] = byte
+            self.id_to_token[byte] = bytes([byte])
         for special_token in self.special_tokens:
-            special_token_id = len(self.vocab)
-            self.vocab[special_token] = special_token_id
-            self.id_to_token[special_token_id] = special_token
-        
+            sid = len(self.vocab)
+            tok = special_token.encode("utf-8")
+            self.vocab[tok] = sid
+            self.id_to_token[sid] = tok
 
     def _train_pre_tokenizer(self):
         with open(self.input_path, "rb") as f:
@@ -110,135 +114,134 @@ class BPETokenizer:
                 (self.input_path, start, end, self.special_tokens)
                 for start, end in zip(boundaries[:-1], boundaries[1:])
             ]
-
-        # The following is a serial implementation, but you can parallelize this
-        # by sending each start/end pair to a set of processes.
-        # 1. Pre-tokenization is done in parallel 
         with multiprocessing.Pool() as pool:
             counters = pool.map(pre_tokenization, tasks)
-        
+
         self._pre_tokenizer = Counter()
         for counter in counters:
             self._pre_tokenizer.update(counter)
 
-    def _read_corpus(self, input_path: str |  os.PathLike) -> str:
-        with open(input_path, 'r') as f:
-            return f.read()
-
     def train_bpe(self, vocab_size: int) -> None:
-        import time 
         start_time = time.time()
         self._reset()
-        print(f"[{time.time() - start_time}] Training pre-tokenizer...")
+        print(f"[{time.time() - start_time:.2f}] Training pre-tokenizer...")
         self._train_pre_tokenizer()
-        print(f"[{time.time() - start_time}] Pre-tokenizer trained")
+        print(f"[{time.time() - start_time:.2f}] Pre-tokenizer trained")
+
         pre_token_words = Counter()
         for token, count in self._pre_tokenizer.items():
-            token_ids = tuple(token.encode('utf-8'))
-            pre_token_words[token_ids] += count
-        
-        print(f"[{time.time() - start_time}] Training BPE...")
-        self._train_bpe(vocab_size, pre_token_words, start_time)
-        print(f"[{time.time() - start_time}] BPE trained")
+            pre_token_words[tuple(token.encode("utf-8"))] += count
 
-    def _train_bpe(self, vocab_size: int, pre_token_words: Counter, start_time: float) -> None:
-        _counter = self._initialize_counter(pre_token_words)
+        print(f"[{time.time() - start_time:.2f}] Training BPE...")
+        self._train_bpe(vocab_size, pre_token_words, start_time)
+        print(f"[{time.time() - start_time:.2f}] BPE trained")
+
+    def _train_bpe(self, vocab_size, pre_token_words, start_time) -> None:
+        pair_counter, heap, pair_to_words = self._initialize_counter(pre_token_words)
         while len(self.vocab) < vocab_size:
-            if len(self.vocab) % 100 == 0:
-                print(f"[{time.time() - start_time}] Training BPE... {len(self.vocab)} / {vocab_size}")
-            result = self._get_most_frequent_pair(_counter)
+            if len(self.vocab) % 500 == 0:
+                print(f"[{time.time() - start_time:.2f}] {len(self.vocab)} / {vocab_size}")
+            result = self._pop_most_frequent_pair(pair_counter, heap)
             if result is None:
                 break
-            pairs, cnt = result
-            # print(f"Len vocab: {len(self.vocab)}, Most frequent pair: {pairs}")
-            self._merge_pair(pairs, pre_token_words)
+            _count, pair = result
+            self._merge_pair(pair, pair_counter, pair_to_words, pre_token_words, heap)
 
-            _counter = self._initialize_counter(pre_token_words)
-        
-    def _build_index(self, pre_token_words: Counter):
-        pair_count = Counter()
-        pair_to_words = {}
-        for token_ids, count in pre_token_words.items():
-            for pair in self._iter_pairs(token_ids):
-                pair_count[pair] += count
-                pair_to_words.setdefault(pair, set()).add(token_ids)
-        return pair_count, pair_to_words
+    def _initialize_counter(self, pre_token_words):
+        pair_counter = Counter()
+        pair_to_words = {}      # pair(id, id) -> set of words (current form)
+        for word, count in pre_token_words.items():
+            for a, b in zip(word, word[1:]):
+                pair_counter[(a, b)] += count
+                pair_to_words.setdefault((a, b), set()).add(word)
 
-    def _initialize_counter(self, pre_token_words: Counter) -> Counter:
-        counter = Counter()
-        
-        for token_ids, count in pre_token_words.items():
-            for i in range(len(token_ids) - 1):
-                pair = (token_ids[i], token_ids[i + 1])
-                counter[pair] += count
-        return counter
+        heap = []
+        for pair, count in pair_counter.items():
+            key = (self.id_to_token[pair[0]], self.id_to_token[pair[1]])
+            heappush(heap, (-count, RevPair(key), pair))
+        return pair_counter, heap, pair_to_words
 
-    def _get_most_frequent_pair(self, counter: Counter) -> tuple[int, int]:
-        if not counter:
-            return None
-        return max(
-            counter.items(),
-            key=lambda item: (
-                item[1],
-                self.id_to_token[item[0][0]],
-                self.id_to_token[item[0][1]],
-            ),
-        )
+    def _pop_most_frequent_pair(self, pair_counter, heap):
+        # Lazy deletion: skip entries whose stored count no longer matches reality.
+        while heap:
+            neg_count, _rev, pair = heappop(heap)
+            if pair_counter.get(pair, 0) == -neg_count:
+                return -neg_count, pair
+        return None
 
-    def _merge_pair(self, pair: tuple[int, int], pre_token_words: Counter) -> None:
-        left_token, right_token = self.id_to_token[pair[0]], self.id_to_token[pair[1]]
-        merged_token = left_token + right_token
-
+    def _merge_pair(self, pair, pair_counter, pair_to_words, pre_token_words, heap) -> None:
+        left_id, right_id = pair
+        merged_token = self.id_to_token[left_id] + self.id_to_token[right_id]
         merged_id = len(self.vocab)
         self.vocab[merged_token] = merged_id
         self.id_to_token[merged_id] = merged_token
         self.merge_rank[pair] = len(self.merge_rank)
-        self.merges.append((left_token, right_token))
+        self.merges.append((self.id_to_token[left_id], self.id_to_token[right_id]))
 
-        for token_ids, count in list(pre_token_words.items()):
-            new_token_ids = []
-            merged = False
-            i = 0
-            while i < len(token_ids):
-                if i < len(token_ids) - 1 and (token_ids[i], token_ids[i + 1]) == pair:
-                    new_token_ids.append(merged_id)
-                    merged = True
+        affected = pair_to_words.pop(pair, set())
+        delta = Counter()   # net change to each pair's global count this merge
+
+        for word in affected:
+            count = pre_token_words.get(word, 0)
+            if count == 0:
+                continue
+
+            # subtract every adjacent pair of the old word
+            for a, b in zip(word, word[1:]):
+                delta[(a, b)] -= count
+                s = pair_to_words.get((a, b))
+                if s is not None:
+                    s.discard(word)
+
+            # build the merged word (greedy, left to right)
+            new_word = []
+            i, n = 0, len(word)
+            while i < n:
+                if i < n - 1 and word[i] == left_id and word[i + 1] == right_id:
+                    new_word.append(merged_id)
                     i += 2
                 else:
-                    new_token_ids.append(token_ids[i])
+                    new_word.append(word[i])
                     i += 1
+            new_word = tuple(new_word)
 
-            if merged:
-                pre_token_words[token_ids] -= count
-                if pre_token_words[token_ids] == 0:
-                    del pre_token_words[token_ids]
-                pre_token_words[tuple(new_token_ids)] += count
+            # add every adjacent pair of the new word
+            for a, b in zip(new_word, new_word[1:]):
+                delta[(a, b)] += count
+                pair_to_words.setdefault((a, b), set()).add(new_word)
+
+            # update word frequencies (two old words may collapse into one)
+            del pre_token_words[word]
+            pre_token_words[new_word] = pre_token_words.get(new_word, 0) + count
+
+        # apply net changes; only push pairs that actually moved
+        for p, d in delta.items():
+            if d == 0:
+                continue
+            pair_counter[p] += d
+            c = pair_counter[p]
+            if c <= 0:
+                pair_counter.pop(p, None)
+                pair_to_words.pop(p, None)
+            else:
+                key = (self.id_to_token[p[0]], self.id_to_token[p[1]])
+                heappush(heap, (-c, RevPair(key), p))
 
     def encode(self, text: str) -> list[int]:
+        # NOTE: placeholder — single-char lookup, does not yet apply learned merges.
         result = []
-        # use the current tokenizer to tokenize the text
         for char in text:
-            if char not in self.vocab:
-                result.append(-1) # unknown token
-                continue
-            # find the longest prefix of the char in the vocab
-            result.append(self.vocab[char])
+            result.append(self.vocab.get(char, -1))
         return result
 
 
 if __name__ == "__main__":
-    start_time = time.time()
     special_tokens = ["<|endoftext|>"]
     max_vocab_size = 10000
-    
-    input_path = "data/ashe.txt"
+
     input_path = "data/TinyStoriesV2-GPT4-train.txt"
 
-    # 2. Train the BPE model 
-    encoder = BPETokenizer(input_path, 500, special_tokens)
+    encoder = BPETokenizer(input_path, max_vocab_size, special_tokens)
     start_time = time.time()
     encoder.train_bpe(max_vocab_size)
-    print(f"Time taken for training BPE: {time.time() - start_time} seconds")
-    #print(f"Vocab: {encoder.vocab}")
-    #print(f"Id to token: {encoder.id_to_token}")
-    #print(f"Merge rank: {encoder.merge_rank}")
+    print(f"Time taken for training BPE: {time.time() - start_time:.2f} seconds")
