@@ -3,7 +3,7 @@ import time
 import regex as re
 import multiprocessing
 from collections import Counter
-from typing import BinaryIO, Iterable
+from typing import BinaryIO, Iterable, Iterator
 from heapq import heappush, heappop
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -228,11 +228,54 @@ class BPETokenizer:
                 heappush(heap, (-c, RevPair(key), p))
 
     def encode(self, text: str) -> list[int]:
-        # NOTE: placeholder — single-char lookup, does not yet apply learned merges.
         result = []
-        for char in text:
-            result.append(self.vocab.get(char, -1))
+        if self.special_tokens:
+            special_pattern = "(" + "|".join(re.escape(token) for token in self.special_tokens) + ")"
+            pieces = re.split(special_pattern, text)
+        else:
+            pieces = [text]
+        for piece in pieces:
+            if piece == "":
+                continue
+            if piece in self.special_tokens:
+                result.append(self.vocab[piece.encode("utf-8")])
+                continue
+            for match in re.finditer(PAT, piece):
+                token = match.group()
+                ids = list(token.encode("utf-8"))
+                while True:
+                    candidate_pairs = []
+                    for i in range(len(ids) - 1):
+                        pair = (ids[i], ids[i + 1])
+                        if pair in self.merge_rank:
+                            candidate_pairs.append(pair)
+                    if not candidate_pairs:
+                        break
+                    best_pair = min(candidate_pairs, key=lambda pair: self.merge_rank[pair])
+                    left_token = self.id_to_token[best_pair[0]]
+                    right_token = self.id_to_token[best_pair[1]]
+                    merged_id = self.vocab[left_token + right_token]
+                    ids = self._merge_pair_in_ids(ids, best_pair, merged_id)
+                result.extend(ids)
         return result
+    
+    def _merge_pair_in_ids(self, ids: list[int], pair: tuple[int, int], merged_id: int) -> list[int]:
+        new_ids = []
+        i = 0
+        while i < len(ids):
+            if i < len(ids) - 1 and (ids[i], ids[i + 1]) == pair:
+                new_ids.append(merged_id)
+                i += 2
+            else:
+                new_ids.append(ids[i])
+                i += 1
+        return new_ids
+    
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        pass
+
+    def decode(self, ids: list[int]) -> str:
+        return b"".join(self.id_to_token[id] for id in ids).decode("utf-8", errors="replace")
 
 
 if __name__ == "__main__":
